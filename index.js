@@ -8,12 +8,19 @@ const multipleBackupPlugin = (ctx) => {
   let cachedImageData = null
   
   /**
+   * 获取当前默认图床
+   */
+  const getCurrentUploader = () => {
+    return ctx.getConfig('picBed.uploader') || ctx.getConfig('picBed.current')
+  }
+  
+  /**
    * 获取所有已配置的图床列表（排除当前默认图床）
    */
   const getConfiguredUploaders = () => {
     try {
       const allUploaders = ctx.helper.uploader.getIdList()
-      const currentUploader = ctx.getConfig('picBed.uploader') || ctx.getConfig('picBed.current')
+      const currentUploader = getCurrentUploader()
       
       return allUploaders
         .filter((type) => type !== currentUploader && type !== 'multiple-backup') // 排除当前默认图床和自己
@@ -35,6 +42,136 @@ const multipleBackupPlugin = (ctx) => {
   }
 
   /**
+   * 创建备份上传上下文
+   */
+  const createBackupContext = (cachedItems, successItems) => {
+    // 创建备份上传的上下文，使用缓存的图片数据
+    const backupCtx = Object.create(Object.getPrototypeOf(ctx))
+    Object.assign(backupCtx, ctx)
+    
+    // 确保关键方法的this绑定正确
+    const methodsToBinds = ['getConfig', 'saveConfig', 'request', 'emit']
+    methodsToBinds.forEach(method => {
+      if (ctx[method]) {
+        backupCtx[method] = ctx[method].bind(ctx)
+      }
+    })
+    
+    backupCtx.log = ctx.log || console
+    
+    // 使用缓存的图片数据，结合成功上传项的文件名信息
+    backupCtx.output = cachedItems.map((cachedItem, index) => {
+      const successItem = successItems[index]
+      return {
+        ...cachedItem,
+        // 确保使用与成功上传相同的文件名
+        fileName: successItem ? successItem.fileName : cachedItem.fileName,
+        // 清除URL字段，强制重新上传
+        imgUrl: undefined,
+        url: undefined
+      }
+    })
+    
+    // 确保其他可能需要的属性也被复制
+    const propertiesToCopy = ['baseDir', 'configPath', 'helper']
+    propertiesToCopy.forEach(prop => {
+      if (ctx[prop]) {
+        backupCtx[prop] = ctx[prop]
+      }
+    })
+    
+    return backupCtx
+  }
+
+  /**
+   * 设置备份上下文的request方法
+   */
+  const setupRequestMethod = (backupCtx, uploaderType) => {
+    // 验证request方法是否可用
+    if (!backupCtx.request || typeof backupCtx.request !== 'function') {
+      ctx.log.warn(`[Multiple Backup] ${uploaderType} 上下文缺少request方法，尝试使用备用实现`)
+      
+      // 尝试使用备用的request实现
+      if (ctx.Request && ctx.Request.request) {
+        // 旧版本的PicGo使用ctx.Request.request
+        backupCtx.request = ctx.Request.request.bind(ctx.Request)
+        backupCtx.Request = ctx.Request // 确保Request对象也被复制
+        ctx.log.info(`[Multiple Backup] 使用旧版本的ctx.Request.request方法`)
+        return true
+      } else if (typeof require !== 'undefined') {
+        // 如果都没有，尝试直接使用axios
+        try {
+          const axios = require('axios')
+          backupCtx.request = async (options) => {
+            const response = await axios(options)
+            return response.data
+          }
+          ctx.log.info(`[Multiple Backup] 使用直接的axios实现`)
+          return true
+        } catch (error) {
+          ctx.log.error(`[Multiple Backup] 无法创建request方法:`, error)
+          return false
+        }
+      } else {
+        return false
+      }
+    }
+    return true
+  }
+
+  /**
+   * 记录调试信息
+   */
+  const logDebugInfo = (uploaderType, backupCtx) => {
+    ctx.log.info(`[Multiple Backup Debug] 备份上下文创建完成，准备调用 ${uploaderType} 上传器`)
+    ctx.log.info(`[Multiple Backup Debug] 上下文方法检查: request=${!!backupCtx.request}, getConfig=${!!backupCtx.getConfig}, Request=${!!backupCtx.Request}`)
+    
+    // 记录输入数据用于对比
+    ctx.log.info(`[Multiple Backup Debug] ${uploaderType} 输入数据:`, backupCtx.output.map(item => ({
+      fileName: item.fileName,
+      buffer: item.buffer ? `Buffer(${item.buffer.length}bytes)` : 'undefined',
+      base64Image: item.base64Image ? `Base64(${item.base64Image.length}chars)` : 'undefined'
+    })))
+  }
+
+  /**
+   * 验证备份结果
+   */
+  const validateBackupResults = (backupCtx, uploaderType) => {
+    // 详细记录返回的结果用于调试
+    if (backupCtx.output) {
+      backupCtx.output.forEach((item, index) => {
+        ctx.log.info(`[Multiple Backup Debug] ${uploaderType} 返回项 ${index + 1}:`, {
+          fileName: item.fileName,
+          imgUrl: item.imgUrl,
+          url: item.url,
+          hasImgUrl: !!item.imgUrl,
+          hasUrl: !!item.url,
+          allKeys: Object.keys(item)
+        })
+      })
+    } else {
+      ctx.log.error(`[Multiple Backup Debug] ${uploaderType} 没有返回output结果`)
+    }
+    
+    // 检查是否真正上传成功
+    const hasValidResults = backupCtx.output && 
+                           backupCtx.output.length > 0 && 
+                           backupCtx.output.some(item => item.imgUrl || item.url)
+
+    if (!hasValidResults) {
+      throw new Error(`${uploaderType} 上传未返回有效的URL`)
+    }
+
+    // 记录成功的上传结果
+    backupCtx.output.forEach((item, index) => {
+      if (item.imgUrl || item.url) {
+        ctx.log.info(`[Multiple Backup Debug] ${uploaderType} 文件 ${index + 1}: ${item.imgUrl || item.url}`)
+      }
+    })
+  }
+
+  /**
    * 备份上传到指定图床
    */
   const backupUploadToUploader = async (uploaderType, cachedItems, successItems) => {
@@ -46,111 +183,24 @@ const multipleBackupPlugin = (ctx) => {
 
       ctx.log.info(`[Multiple Backup Debug] 开始备份到 ${uploaderType}，使用缓存数据:`, cachedItems.length, '个文件')
 
-      // 创建备份上传的上下文，使用缓存的图片数据
-      const backupCtx = Object.create(Object.getPrototypeOf(ctx))
-      
-      // 复制所有属性和方法，确保正确的this绑定
-      Object.assign(backupCtx, ctx)
-      
-      // 确保关键方法的this绑定正确
-      backupCtx.getConfig = ctx.getConfig.bind(ctx)
-      backupCtx.saveConfig = ctx.saveConfig.bind(ctx)
-      backupCtx.request = ctx.request ? ctx.request.bind(ctx) : undefined
-      backupCtx.emit = ctx.emit ? ctx.emit.bind(ctx) : undefined
-      backupCtx.log = ctx.log || console
-      
-      // 使用缓存的图片数据，结合成功上传项的文件名信息
-      backupCtx.output = cachedItems.map((cachedItem, index) => {
-        const successItem = successItems[index]
-        return {
-          ...cachedItem,
-          // 确保使用与成功上传相同的文件名
-          fileName: successItem ? successItem.fileName : cachedItem.fileName,
-          // 清除URL字段，强制重新上传
-          imgUrl: undefined,
-          url: undefined
-        }
-      })
-      
-      // 验证request方法是否可用
-      if (!backupCtx.request || typeof backupCtx.request !== 'function') {
-        ctx.log.warn(`[Multiple Backup] ${uploaderType} 上下文缺少request方法，尝试使用备用实现`)
-        
-        // 尝试使用备用的request实现
-        if (ctx.Request && ctx.Request.request) {
-          // 旧版本的PicGo使用ctx.Request.request
-          backupCtx.request = ctx.Request.request.bind(ctx.Request)
-          backupCtx.Request = ctx.Request // 确保Request对象也被复制
-          ctx.log.info(`[Multiple Backup] 使用旧版本的ctx.Request.request方法`)
-        } else if (typeof require !== 'undefined') {
-          // 如果都没有，尝试直接使用axios
-          try {
-            const axios = require('axios')
-            backupCtx.request = async (options) => {
-              const response = await axios(options)
-              return response.data
-            }
-            ctx.log.info(`[Multiple Backup] 使用直接的axios实现`)
-          } catch (error) {
-            ctx.log.error(`[Multiple Backup] 无法创建request方法:`, error)
-            throw new Error(`${uploaderType} 上传器需要HTTP请求方法，但无法找到可用的实现`)
-          }
-        } else {
-          throw new Error(`${uploaderType} 上传器需要ctx.request方法，请检查PicGo版本`)
-        }
+      // 创建备份上传上下文
+      const backupCtx = createBackupContext(cachedItems, successItems)
+
+      // 设置request方法
+      if (!setupRequestMethod(backupCtx, uploaderType)) {
+        throw new Error(`${uploaderType} 上传器需要HTTP请求方法，但无法找到可用的实现`)
       }
 
-      ctx.log.info(`[Multiple Backup Debug] 备份上下文创建完成，准备调用 ${uploaderType} 上传器`)
-      ctx.log.info(`[Multiple Backup Debug] 上下文方法检查: request=${!!backupCtx.request}, getConfig=${!!backupCtx.getConfig}, Request=${!!backupCtx.Request}`)
-      
-      // 确保其他可能需要的属性也被复制
-      if (ctx.baseDir) backupCtx.baseDir = ctx.baseDir
-      if (ctx.configPath) backupCtx.configPath = ctx.configPath
-      if (ctx.helper) backupCtx.helper = ctx.helper
-      
-      // 记录输入数据用于对比
-      ctx.log.info(`[Multiple Backup Debug] ${uploaderType} 输入数据:`, backupCtx.output.map(item => ({
-        fileName: item.fileName,
-        buffer: item.buffer ? `Buffer(${item.buffer.length}bytes)` : 'undefined',
-        base64Image: item.base64Image ? `Base64(${item.base64Image.length}chars)` : 'undefined'
-      })))
+      // 记录调试信息
+      logDebugInfo(uploaderType, backupCtx)
 
       // 执行备份上传
       await uploader.handle(backupCtx)
 
       ctx.log.info(`[Multiple Backup Debug] ${uploaderType} 上传器执行完成，结果:`, backupCtx.output?.length || 0, '个文件')
       
-      // 详细记录返回的结果用于调试
-      if (backupCtx.output) {
-        backupCtx.output.forEach((item, index) => {
-          ctx.log.info(`[Multiple Backup Debug] ${uploaderType} 返回项 ${index + 1}:`, {
-            fileName: item.fileName,
-            imgUrl: item.imgUrl,
-            url: item.url,
-            hasImgUrl: !!item.imgUrl,
-            hasUrl: !!item.url,
-            allKeys: Object.keys(item)
-          })
-        })
-      } else {
-        ctx.log.error(`[Multiple Backup Debug] ${uploaderType} 没有返回output结果`)
-      }
-      
-      // 检查是否真正上传成功
-      const hasValidResults = backupCtx.output && 
-                             backupCtx.output.length > 0 && 
-                             backupCtx.output.some(item => item.imgUrl || item.url)
-
-      if (!hasValidResults) {
-        throw new Error(`${uploaderType} 上传未返回有效的URL`)
-      }
-
-      // 记录成功的上传结果
-      backupCtx.output.forEach((item, index) => {
-        if (item.imgUrl || item.url) {
-          ctx.log.info(`[Multiple Backup Debug] ${uploaderType} 文件 ${index + 1}: ${item.imgUrl || item.url}`)
-        }
-      })
+      // 验证备份结果
+      validateBackupResults(backupCtx, uploaderType)
 
       return {
         uploader: uploaderType,
@@ -173,6 +223,7 @@ const multipleBackupPlugin = (ctx) => {
   const performBackupUpload = async (ctx) => {
     const config = ctx.getConfig('picgo-plugin-multiple-backup')
     
+    // 早期退出检查
     if (!config?.backupUploaders || config.backupUploaders.length === 0) {
       if (config?.enableLog) {
         ctx.log.info('[Multiple Backup] 未配置备份图床，跳过备份')
@@ -180,41 +231,40 @@ const multipleBackupPlugin = (ctx) => {
       return
     }
 
-    // 检查是否有缓存的图片数据
     if (!cachedImageData || cachedImageData.length === 0) {
       ctx.log.error('[Multiple Backup] 缓存的图片数据不存在，无法进行备份')
       return
     }
 
-    // 检查是否有成功上传的图片
     if (!ctx.output || ctx.output.length === 0 || !ctx.output.some(item => item.imgUrl)) {
       if (config?.enableLog) {
         ctx.log.info('[Multiple Backup] 主图床上传失败，跳过备份')
       }
-      // 清理缓存
-      cachedImageData = null
+      cachedImageData = null // 清理缓存
       return
     }
 
-    const currentUploader = ctx.getConfig('picBed.uploader') || ctx.getConfig('picBed.current')
+    const currentUploader = getCurrentUploader()
     
     ctx.log.info(`[Multiple Backup] 主图床 ${currentUploader} 上传成功，开始备份到 ${config.backupUploaders.length} 个图床`)
     
-    // 记录原始上传结果和缓存数据用于调试
-    ctx.output.forEach((item, index) => {
-      ctx.log.info(`[Multiple Backup Debug] 原始文件 ${index + 1}: ${item.fileName} -> ${item.imgUrl}`)
-    })
-    
-    cachedImageData.forEach((item, index) => {
-      ctx.log.info(`[Multiple Backup Debug] 缓存数据 ${index + 1}: ${item.fileName}, buffer: ${item.buffer ? 'available' : 'missing'}`)
-    })
-
-    // 并发执行所有备份上传，使用缓存的图片数据
-    const backupPromises = config.backupUploaders.map(uploaderType => 
-      backupUploadToUploader(uploaderType, cachedImageData, ctx.output)
-    )
+    // 记录调试信息
+    if (config?.enableLog) {
+      ctx.output.forEach((item, index) => {
+        ctx.log.info(`[Multiple Backup Debug] 原始文件 ${index + 1}: ${item.fileName} -> ${item.imgUrl}`)
+      })
+      
+      cachedImageData.forEach((item, index) => {
+        ctx.log.info(`[Multiple Backup Debug] 缓存数据 ${index + 1}: ${item.fileName}, buffer: ${item.buffer ? 'available' : 'missing'}`)
+      })
+    }
 
     try {
+      // 并发执行所有备份上传
+      const backupPromises = config.backupUploaders.map(uploaderType => 
+        backupUploadToUploader(uploaderType, cachedImageData, ctx.output)
+      )
+      
       const results = await Promise.allSettled(backupPromises)
       const successCount = results.filter(r => 
         r.status === 'fulfilled' && r.value.success
@@ -222,7 +272,7 @@ const multipleBackupPlugin = (ctx) => {
 
       ctx.log.info(`[Multiple Backup] 备份完成: ${successCount}/${config.backupUploaders.length} 个成功`)
       
-      // 详细记录每个备份的结果
+      // 记录备份结果
       results.forEach(result => {
         if (result.status === 'fulfilled') {
           const { uploader, success, results: uploadResults } = result.value
@@ -290,7 +340,7 @@ const multipleBackupPlugin = (ctx) => {
    */
   const config = () => {
     const configuredUploaders = getConfiguredUploaders()
-    const currentUploader = ctx.getConfig('picBed.uploader') || ctx.getConfig('picBed.current')
+    const currentUploader = getCurrentUploader()
     
     if (configuredUploaders.length === 0) {
       return [
