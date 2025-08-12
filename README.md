@@ -56,6 +56,8 @@ npm install picgo-plugin-multiple-backup
 - **选择备份图床**：可多选，选择要备份到的图床
 - **启用详细日志**：建议开启，用于调试和监控备份状态
 
+![插件设置界面](./images/setting.png)
+
 ## 🎯 使用方法
 
 配置完成后，插件会自动工作：
