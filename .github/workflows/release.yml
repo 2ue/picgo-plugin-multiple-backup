@@ -1,0 +1,102 @@
+name: Release and Publish
+
+# 触发条件：推送 tag
+on:
+  push:
+    tags:
+      - 'v*.*.*'  # 匹配语义化版本标签
+
+jobs:
+  release:
+    name: Build, Test and Release
+    runs-on: ubuntu-latest
+    
+    permissions:
+      contents: write  # 创建 release
+      id-token: write  # NPM 发布
+
+    steps:
+      # 1. 检出代码
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # 2. 设置 Node.js
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          registry-url: 'https://registry.npmjs.org'
+
+      # 3. 获取版本信息
+      - name: Get version
+        id: version
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          TAG=${GITHUB_REF#refs/tags/}
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+
+      # 4. 创建发布包
+      - name: Create release archive
+        run: |
+          mkdir -p release-temp
+          cp index.js package.json README.md LICENSE release-temp/
+          cd release-temp && tar -czf ../picgo-plugin-multiple-backup-${{ steps.version.outputs.tag }}.tar.gz .
+
+      # 5. 发布到 NPM
+      - name: Publish to NPM
+        uses: JS-DevTools/npm-publish@v3
+        with:
+          token: ${{ secrets.NPM_TOKEN }}
+          access: public
+
+      # 6. 创建 GitHub Release  
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "PicGo Multiple Backup Plugin ${{ steps.version.outputs.tag }}"
+          body: |
+            ## PicGo 多图床备份插件 ${{ steps.version.outputs.tag }}
+
+            🚀 **新版本发布！**
+
+            ### 📦 安装方式
+            
+            **PicGo 应用内安装：**
+            1. 打开 PicGo 应用
+            2. 进入 `插件设置`
+            3. 搜索 `multiple-backup`
+            4. 点击 `安装`
+
+            **NPM 安装：**
+            ```bash
+            npm install picgo-plugin-multiple-backup@${{ steps.version.outputs.version }}
+            ```
+
+            ### ✨ 功能特性
+            - ✅ 后台自动运行 - 无需手动操作，上传图片后自动触发备份
+            - ✅ 多图床支持 - 支持所有 PicGo 兼容的图床服务
+            - ✅ 路径一致性 - 确保所有图床的文件路径完全一致，便于切换
+            - ✅ 并发上传 - 同时向多个备份图床上传，提高效率
+            - ✅ 智能配置 - 自动检测已配置的图床，排除当前默认图床
+            - ✅ 详细日志 - 完整的上传过程记录，便于问题排查
+
+            ### 🔗 相关链接
+            - [NPM 包](https://www.npmjs.com/package/picgo-plugin-multiple-backup)
+            - [GitHub 仓库](https://github.com/${{ github.repository }})
+            - [PicGo 官网](https://molunerfinn.com/PicGo/)
+
+            ### 📋 发布信息
+            - **提交哈希**: ${{ github.sha }}
+            - **构建环境**: GitHub Actions
+
+            ---
+            *通过 GitHub Actions 自动构建发布*
+          files: |
+            picgo-plugin-multiple-backup-*.tar.gz
+          draft: false
+          prerelease: ${{ contains(github.ref, '-beta') || contains(github.ref, '-alpha') || contains(github.ref, '-rc') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
