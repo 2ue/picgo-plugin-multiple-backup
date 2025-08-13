@@ -1,6 +1,6 @@
 {
   "name": "picgo-plugin-multiple-backup",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "description": "PicGo插件：多图床备份上传，在主图床上传成功后自动备份到其他存储服务，确保图片链接路径一致",
   "main": "index.js",
   "keywords": [
